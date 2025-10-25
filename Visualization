@@ -1,0 +1,208 @@
+"""
+Plot prediction vs actual, feature importances, and category engagement trends
+for BOTH the API and Scraped models.
+"""
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import numpy as np
+import joblib
+import os
+from sklearn.model_selection import train_test_split
+
+# --- Configuration ---
+sns.set(style='whitegrid', palette='muted', font_scale=1.1)
+
+# Paths
+API_DATA_PATH = 'data/processed/api_preprocessed.parquet'
+API_X_PATH = 'data/processed/X_api_features.parquet'
+API_Y_PATH = 'data/processed/y_api_target.parquet'
+
+SCRAPED_X_PATH = 'data/processed/X_scraped_features.parquet'
+SCRAPED_Y_PATH = 'data/processed/y_scraped_target.parquet'
+
+API_RF_MODEL_PATH = 'models/rf_api_model.joblib'
+API_XGB_MODEL_PATH = 'models/xgb_api_model.joblib'
+API_RF_FI_PATH = 'models/rf_api_permutation_importance.csv'
+API_XGB_FI_PATH = 'models/xgb_api_permutation_importance.csv'
+
+SCRAPED_RF_MODEL_PATH = 'models/rf_scraped_model.joblib'
+SCRAPED_XGB_MODEL_PATH = 'models/xgb_scraped_model.joblib'
+SCRAPED_RF_FI_PATH = 'models/rf_scraped_permutation_importance.csv'
+SCRAPED_XGB_FI_PATH = 'models/xgb_scraped_permutation_importance.csv'
+
+VIZ_DIR = 'viz'
+
+# --- Helper Functions ---
+
+def load_data(x_path, y_path):
+    """Loads feature and target data."""
+    try:
+        X = pd.read_parquet(x_path)
+        y = pd.read_parquet(y_path).squeeze()
+        # Get the exact same test split used in training
+        _, X_test, _, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        return X, y, X_test, y_test
+    except FileNotFoundError:
+        print(f"Warning: Data not found at {x_path} or {y_path}. Skipping...")
+        return None, None, None, None
+
+def plot_pred_vs_actual(y_true, y_pred, title, out_path):
+    """Saves a scatter plot of predicted vs. actual values."""
+    plt.figure(figsize=(8, 8))
+    plt.scatter(y_true, y_pred, s=10, alpha=0.5, label='Predictions')
+    # Add ideal fit line
+    mn = min(y_true.min(), y_pred.min())
+    mx = max(y_true.max(), y_pred.max())
+    plt.plot([mn, mx], [mn, mx], 'r--', linewidth=2, label='Ideal Fit')
+    plt.xlabel('Actual log_views')
+    plt.ylabel('Predicted log_views')
+    plt.title(title, fontsize=16)
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(out_path)
+    print(f"Saved plot: {out_path}")
+    plt.close()
+
+def plot_feature_importance(fi_path, title, out_path):
+    """Saves a horizontal bar plot of feature importances."""
+    try:
+        feat_imp = pd.read_csv(fi_path, index_col=0).squeeze("columns")
+    except FileNotFoundError:
+        print(f"Warning: {fi_path} not found. Skipping FI plot.")
+        return
+
+    plt.figure(figsize=(10, 8))
+    feat_imp.head(20).sort_values(ascending=True).plot(kind='barh')
+    plt.title(title, fontsize=16)
+    plt.xlabel('Permutation Importance (R² decrease)')
+    plt.tight_layout()
+    plt.savefig(out_path)
+    print(f"Saved plot: {out_path}")
+    plt.close()
+
+def plot_engagement_by_category(api_data_path, out_path):
+    """Saves a boxplot of engagement rate by category ID."""
+    try:
+        df = pd.read_parquet(api_data_path)
+    except FileNotFoundError:
+        print(f"Warning: {api_data_path} not found. Skipping category plot.")
+        return
+        
+    df['engagement_rate_log'] = np.log1p(df['engagement_rate'].fillna(0))
+    # Get top 15 categories by count to make plot readable
+    top_cats = df['category_id'].value_counts().head(15).index.tolist()
+    df_top = df[df['category_id'].isin(top_cats)]
+
+    plt.figure(figsize=(14, 7))
+    sns.boxplot(
+        x='category_id', 
+        y='engagement_rate_log', 
+        data=df_top, 
+        order=top_cats
+    )
+    plt.title('Log Engagement Rate by Category (Top 15)', fontsize=16)
+    plt.ylabel('log(1 + Engagement Rate)')
+    plt.xlabel('Category ID')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig(out_path)
+    print(f"Saved plot: {out_path}")
+    plt.close()
+
+# --- Main Execution ---
+
+if __name__ == "__main__":
+    print("Generating visualizations...")
+    os.makedirs(VIZ_DIR, exist_ok=True)
+
+    # --- 1. API Model Visualizations ---
+    print("\n--- API Model Plots ---")
+    _, _, X_test_api, y_test_api = load_data(API_X_PATH, API_Y_PATH)
+    
+    if y_test_api is not None:
+        # Plot engagement by category
+        plot_engagement_by_category(
+            API_DATA_PATH, 
+            os.path.join(VIZ_DIR, 'api_engagement_by_category.png')
+        )
+        
+        # Plot API RF results
+        try:
+            model_rf_api = joblib.load(API_RF_MODEL_PATH)
+            preds_rf_api = model_rf_api.predict(X_test_api)
+            plot_pred_vs_actual(
+                y_test_api, preds_rf_api, 
+                'API Model: RandomForest - Predicted vs. Actual', 
+                os.path.join(VIZ_DIR, 'api_rf_pred_vs_actual.png')
+            )
+        except FileNotFoundError:
+            print(f"Warning: {API_RF_MODEL_PATH} not found. Skipping RF plots.")
+        
+        # Plot API XGB results
+        try:
+            model_xgb_api = joblib.load(API_XGB_MODEL_PATH)
+            preds_xgb_api = model_xgb_api.predict(X_test_api)
+            plot_pred_vs_actual(
+                y_test_api, preds_xgb_api, 
+                'API Model: XGBoost - Predicted vs. Actual', 
+                os.path.join(VIZ_DIR, 'api_xgb_pred_vs_actual.png')
+            )
+        except FileNotFoundError:
+            print(f"Warning: {API_XGB_MODEL_PATH} not found. Skipping XGB plots.")
+        
+        # Plot API Feature Importances
+        plot_feature_importance(
+            API_RF_FI_PATH, 
+            'API Model: RandomForest - Top 20 Features', 
+            os.path.join(VIZ_DIR, 'api_rf_feat_imp.png')
+        )
+        plot_feature_importance(
+            API_XGB_FI_PATH, 
+            'API Model: XGBoost - Top 20 Features', 
+            os.path.join(VIZ_DIR, 'api_xgb_feat_imp.png')
+        )
+
+    # --- 2. Scraped Model Visualizations ---
+    print("\n--- Scraped Model Plots ---")
+    _, _, X_test_scraped, y_test_scraped = load_data(SCRAPED_X_PATH, SCRAPED_Y_PATH)
+    
+    if y_test_scraped is not None:
+        # Plot Scraped RF results
+        try:
+            model_rf_scraped = joblib.load(SCRAPED_RF_MODEL_PATH)
+            preds_rf_scraped = model_rf_scraped.predict(X_test_scraped)
+            plot_pred_vs_actual(
+                y_test_scraped, preds_rf_scraped, 
+                'Scraped Model: RandomForest - Predicted vs. Actual', 
+                os.path.join(VIZ_DIR, 'scraped_rf_pred_vs_actual.png')
+            )
+        except FileNotFoundError:
+            print(f"Warning: {SCRAPED_RF_MODEL_PATH} not found. Skipping RF plots.")
+        
+        # Plot Scraped XGB results
+        try:
+            model_xgb_scraped = joblib.load(SCRAPED_XGB_MODEL_PATH)
+            preds_xgb_scraped = model_xgb_scraped.predict(X_test_scraped)
+            plot_pred_vs_actual(
+                y_test_scraped, preds_xgb_scraped, 
+                'Scraped Model: XGBoost - Predicted vs. Actual', 
+                os.path.join(VIZ_DIR, 'scraped_xgb_pred_vs_actual.png')
+            )
+        except FileNotFoundError:
+            print(f"Warning: {SCRAPED_XGB_MODEL_PATH} not found. Skipping XGB plots.")
+        
+        # Plot Scraped Feature Importances
+        plot_feature_importance(
+            SCRAPED_RF_FI_PATH, 
+            'Scraped Model: RandomForest - Top Features', 
+            os.path.join(VIZ_DIR, 'scraped_rf_feat_imp.png')
+        )
+        plot_feature_importance(
+            SCRAPED_XGB_FI_PATH, 
+            'Scraped Model: XGBoost - Top Features', 
+            os.path.join(VIZ_DIR, 'scraped_xgb_feat_imp.png')
+        )
+    
+    print("\nVisualization complete.")

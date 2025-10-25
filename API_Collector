@@ -1,0 +1,192 @@
+"""
+Collect videos using YouTube Data API v3.
+Saves dataframe to data/raw_api.parquet
+
+This script is "append-friendly". If a file at `DATA_PATH`
+already exists, it will load it and only add new videos.
+"""
+import time
+import math
+import pandas as pd
+from googleapiclient.discovery import build
+from tqdm import tqdm
+import os
+import sys
+
+# --- IMPORTANT ---
+# Set your API key either by setting the environment variable
+# `YOUTUBE_API_KEY` or by replacing "YOUR_API_KEY_HERE".
+API_KEY = os.getenv("YOUTUBE_API_KEY", "AIzaSyCYUw9tq9KscFgGSRxj82LASr6iJuLkyDA")
+if API_KEY == "AIzaSyCYUw9tq9KscFgGSRxj82LASr6iJuLkyDA":
+    print("Warning: API key is still set to the default. Please replace it.")
+    # You might want to exit if the key isn't set
+    # sys.exit("API Key not set. Exiting.")
+
+try:
+    RESOURCE = build('youtube', 'v3', developerKey=API_KEY)
+except Exception as e:
+    print(f"Error building YouTube resource. Check API key and network. Error: {e}")
+    sys.exit()
+
+DATA_PATH = 'data/raw_api.parquet'
+QUERIES = [
+    "music", "news", "gaming", "tutorial", "cooking", "comedy", "education",
+    "tech", "science", "vlog", "sports", "style"
+]
+
+def load_existing_data(path):
+    """Loads existing parquet data if it exists, returns DataFrame and set of known IDs."""
+    if os.path.exists(path):
+        print(f"Loading existing data from {path}...")
+        df = pd.read_parquet(path)
+        known_ids = set(df['video_id'].unique())
+        print(f"Loaded {len(df)} records. Found {len(known_ids)} unique video IDs.")
+        return df, known_ids
+    return pd.DataFrame(), set()
+
+def get_video_details(video_ids):
+    """
+    Fetches details for a list of video IDs, in chunks of 50.
+    """
+    out = []
+    # Make API calls in chunks of 50 (max allowed by API)
+    for i in range(0, len(video_ids), 50):
+        chunk = video_ids[i:i+50]
+        try:
+            r = RESOURCE.videos().list(
+                part='snippet,contentDetails,statistics',
+                id=','.join(chunk)
+            ).execute()
+
+            for item in r.get('items', []):
+                snip = item.get('snippet', {})
+                stats = item.get('statistics', {})
+                cd = item.get('contentDetails', {})
+
+                # Handle cases where stats are disabled (e.g., likes/comments)
+                out.append({
+                    'video_id': item['id'],
+                    'title': snip.get('title'),
+                    'description': snip.get('description'),
+                    'tags': snip.get('tags', []),
+                    'category_id': snip.get('categoryId'),
+                    'publish_date': snip.get('publishedAt'),
+                    'duration': cd.get('duration'),
+                    'view_count': int(stats.get('viewCount', 0)) if stats.get('viewCount') else None,
+                    'like_count': int(stats.get('likeCount')) if stats.get('likeCount') else None,
+                    'comment_count': int(stats.get('commentCount')) if stats.get('commentCount') else None,
+                    'channel_id': snip.get('channelId'),
+                    'channel_title': snip.get('channelTitle')
+                })
+        except Exception as e:
+            print(f"Error in get_video_details chunk: {e}")
+            continue # Skip this chunk if it fails
+    return out
+
+
+def collect_by_queries(queries, known_ids, max_videos=3200):
+    """
+    Collects videos by paginating through search queries.
+    Skips videos that are already in the known_ids set.
+    """
+    new_videos = {}
+    total_to_find = max_videos - len(known_ids)
+    if total_to_find <= 0:
+        print("Dataset already meets or exceeds target size. No new videos to fetch.")
+        return {}
+
+    print(f"Target: {max_videos}. Already have: {len(known_ids)}. Need to find: {total_to_find} new videos.")
+    
+    # Keep track of next page tokens for each query
+    page_tokens = {q: None for q in queries}
+    # Track which queries are exhausted
+    exhausted_queries = set()
+    
+    pbar = tqdm(total=total_to_find, desc="Collecting new videos")
+    
+    while len(new_videos) < total_to_find and len(exhausted_queries) < len(queries):
+        for q in queries:
+            if q in exhausted_queries:
+                continue # Skip query if it has no more pages
+                
+            try:
+                # Get the next page token for this query
+                token = page_tokens[q]
+                
+                res = RESOURCE.search().list(
+                    q=q,
+                    part='id',
+                    type='video',
+                    maxResults=50,
+                    pageToken=token
+                ).execute()
+
+                # Get the IDs and filter out ones we already have
+                ids_to_fetch = []
+                for item in res.get('items', []):
+                    vid = item['id']['videoId']
+                    if vid not in known_ids and vid not in new_videos:
+                        ids_to_fetch.append(vid)
+                
+                # Get details for the new, unique IDs
+                if ids_to_fetch:
+                    details = get_video_details(ids_to_fetch)
+                    for d in details:
+                        if len(new_videos) < total_to_find:
+                            new_videos[d['video_id']] = d
+                            pbar.update(1)
+                        else:
+                            break # Reached target
+                
+                # Update page token for next loop
+                page_tokens[q] = res.get('nextPageToken')
+                if not page_tokens[q]:
+                    # No more pages for this query
+                    exhausted_queries.add(q)
+                
+                if len(new_videos) >= total_to_find:
+                    break # Reached target
+
+            except Exception as e:
+                print(f'\nError for query "{q}": {e}')
+                if 'quotaExceeded' in str(e):
+                    print("Quota exceeded. Stopping collection.")
+                    pbar.close()
+                    return new_videos # Return what we have so far
+                
+                exhausted_queries.add(q) # Assume query is dead if it errors
+                time.sleep(2)
+        
+        if len(exhausted_queries) == len(queries):
+            print("\nAll queries exhausted.")
+            break
+            
+    pbar.close()
+    return new_videos
+
+
+if __name__ == '__main__':
+    # Ensure data directory exists
+    os.makedirs('data', exist_ok=True)
+    
+    # 1. Load existing data
+    df_existing, known_ids = load_existing_data(DATA_PATH)
+    
+    # 2. Collect new data
+    new_video_dict = collect_by_queries(QUERIES, known_ids, max_videos=3200)
+    
+    if new_video_dict:
+        df_new = pd.DataFrame(new_video_dict.values())
+        
+        # 3. Combine old and new data
+        df_combined = pd.concat([df_existing, df_new], ignore_index=True)
+        
+        # 4. De-duplicate just in case
+        df_combined.drop_duplicates(subset=['video_id'], keep='last', inplace=True)
+        
+        # 5. Save combined data
+        df_combined.to_parquet(DATA_PATH, index=False)
+        print(f"\nSuccessfully saved {len(df_combined)} total videos to {DATA_PATH}.")
+        print(f"Added {len(df_new)} new videos.")
+    else:
+        print("\nNo new videos collected.")

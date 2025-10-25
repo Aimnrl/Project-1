@@ -1,0 +1,99 @@
+"""
+Evaluate saved models for BOTH API and Scraped data.
+Saves permutation importance results to CSV.
+"""
+import joblib
+import pandas as pd
+import numpy as np
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.inspection import permutation_importance
+from sklearn.model_selection import train_test_split
+import os
+
+def evaluate_model(model_path, X_test, y_test, perm_path=None):
+    """Loads a model and evaluates it on the given test set."""
+    print(f"\n--- Evaluating model: {model_path} ---")
+    model = joblib.load(model_path)
+    preds = model.predict(X_test)
+    
+    metrics = {
+        'rmse': float(np.sqrt(mean_squared_error(y_test, preds))),
+        'r2': float(r2_score(y_test, preds))
+    }
+    print('Test Metrics:', metrics)
+    
+    # --- Permutation Importance ---
+    print("\nCalculating Permutation Importance...")
+    try:
+        perm = permutation_importance(
+            model, X_test, y_test, 
+            n_repeats=10, 
+            random_state=42, 
+            n_jobs=-1
+        )
+        perm_idx = np.argsort(perm.importances_mean)[::-1]
+        perm_series = pd.Series(perm.importances_mean[perm_idx], index=X_test.columns[perm_idx])
+        
+        print("Top 10 Permutation Importances:")
+        print(perm_series.head(10))
+        
+        if perm_path:
+            perm_series.to_csv(perm_path)
+            print(f"Saved permutation importance to {perm_path}")
+            
+    except Exception as e:
+        print(f"Could not calculate permutation importance: {e}")
+        perm_series = None
+
+    return metrics, perm_series
+
+def load_and_split_data(X_path, y_path):
+    """Loads full X and y, then returns the test split."""
+    try:
+        X = pd.read_parquet(X_path)
+        y = pd.read_parquet(y_path).squeeze()
+        print(f"Loaded {len(X)} records from {X_path}")
+    except FileNotFoundError:
+        print(f"Error: Could not find '{X_path}' or '{y_path}'.")
+        print("Please run 'preprocessing/feature_engineer.py' first.")
+        return None, None
+    
+    _, X_test, _, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    print(f"Using test set of {len(X_test)} records.")
+    return X_test, y_test
+
+if __name__ == '__main__':
+    os.makedirs('models', exist_ok=True)
+    
+    # --- Evaluate API Models ---
+    print("\n--- EVALUATING API MODELS ---")
+    X_test_api, y_test_api = load_and_split_data(
+        'data/processed/X_api_features.parquet',
+        'data/processed/y_api_target.parquet'
+    )
+    
+    if X_test_api is not None:
+        for model_name in ['rf_api', 'xgb_api']:
+            mpath = f'models/{model_name}_model.joblib'
+            perm_path = f'models/{model_name}_permutation_importance.csv'
+            try:
+                evaluate_model(mpath, X_test_api, y_test_api, perm_path=perm_path)
+            except FileNotFoundError:
+                print(f"Error: Model file not found at {mpath}. Run 'models/train.py' first.")
+
+    # --- Evaluate Scraped Models ---
+    print("\n--- EVALUATING SCRAPED MODELS ---")
+    X_test_scraped, y_test_scraped = load_and_split_data(
+        'data/processed/X_scraped_features.parquet',
+        'data/processed/y_scraped_target.parquet'
+    )
+    
+    if X_test_scraped is not None:
+        for model_name in ['rf_scraped', 'xgb_scraped']:
+            mpath = f'models/{model_name}_model.joblib'
+            perm_path = f'models/{model_name}_permutation_importance.csv'
+            try:
+                evaluate_model(mpath, X_test_scraped, y_test_scraped, perm_path=perm_path)
+            except FileNotFoundError:
+                print(f"Error: Model file not found at {mpath}. Run 'models/train.py' first.")
+

@@ -1,0 +1,113 @@
+"""
+Train RandomForest and XGBoost regressors for BOTH API and Scraped data.
+Loads data from data/processed/
+Saves models and metrics to models/
+"""
+import joblib
+import numpy as np
+import pandas as pd
+import json
+import os
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
+from sklearn.metrics import mean_squared_error, r2_score
+
+def train_and_evaluate(X, y, model_name='rf', data_source='api', out_path='models/'):
+    """Trains a model, saves it, and saves its metrics."""
+    full_model_name = f"{model_name}_{data_source}"
+    print(f"\nStarting training for model: {full_model_name}")
+    
+    # Ensure output directory exists
+    os.makedirs(out_path, exist_ok=True)
+    
+    # Handle empty data
+    if X.empty or y.empty:
+        print(f"Skipping {full_model_name} due to empty data.")
+        return None
+        
+    # Split the data
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    # Initialize model
+    if model_name=='rf':
+        model = RandomForestRegressor(n_estimators=100, max_depth=10, n_jobs=-1, random_state=42)
+    else:
+        model = XGBRegressor(n_estimators=100, max_depth=5, learning_rate=0.1, n_jobs=-1, random_state=42, 
+                             objective='reg:squarederror', eval_metric='rmse')
+    
+    # Train model
+    model.fit(X_train, y_train)
+    
+    # Get predictions
+    pred_train = model.predict(X_train)
+    pred_test = model.predict(X_test)
+    
+    # Calculate metrics
+    metrics = {
+        'model_name': full_model_name,
+        'train_rmse': float(np.sqrt(mean_squared_error(y_train, pred_train))),
+        'test_rmse': float(np.sqrt(mean_squared_error(y_test, pred_test))),
+        'train_r2': float(r2_score(y_train, pred_train)),
+        'test_r2': float(r2_score(y_test, pred_test)),
+    }
+    
+    # Save model and metrics
+    model_path = os.path.join(out_path, f'{full_model_name}_model.joblib')
+    metrics_path = os.path.join(out_path, f'{full_model_name}_metrics.json')
+    
+    joblib.dump(model, model_path)
+    print(f"Saved model to {model_path}")
+    
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics, f, indent=4)
+    print(f"Saved metrics to {metrics_path}")
+    
+    return metrics
+
+def load_data(X_path, y_path):
+    """Helper to load feature/target files."""
+    try:
+        X = pd.read_parquet(X_path)
+        y = pd.read_parquet(y_path).squeeze()
+        return X, y
+    except FileNotFoundError:
+        print(f"Warning: Could not find {X_path} or {y_path}. Skipping...")
+        return pd.DataFrame(), pd.Series()
+
+if __name__ == '__main__':
+    
+    # --- Load API Data ---
+    X_api, y_api = load_data(
+        'data/processed/X_api_features.parquet',
+        'data/processed/y_api_target.parquet'
+    )
+    
+    # --- Load Scraped Data ---
+    X_scraped, y_scraped = load_data(
+        'data/processed/X_scraped_features.parquet',
+        'data/processed/y_scraped_target.parquet'
+    )
+
+    # --- Train API Models ---
+    if not X_api.empty:
+        rf_api_metrics = train_and_evaluate(X_api, y_api, 'rf', 'api')
+        xgb_api_metrics = train_and_evaluate(X_api, y_api, 'xgb', 'api')
+        
+        print("\n--- RF API Metrics ---")
+        print(json.dumps(rf_api_metrics, indent=4))
+        
+        print("\n--- XGB API Metrics ---")
+        print(json.dumps(xgb_api_metrics, indent=4))
+    
+    # --- Train Scraped Models ---
+    if not X_scraped.empty:
+        rf_scraped_metrics = train_and_evaluate(X_scraped, y_scraped, 'rf', 'scraped')
+        xgb_scraped_metrics = train_and_evaluate(X_scraped, y_scraped, 'xgb', 'scraped')
+        
+        print("\n--- RF Scraped Metrics ---")
+        print(json.dumps(rf_scraped_metrics, indent=4))
+        
+        print("\n--- XGB Scraped Metrics ---")
+        print(json.dumps(xgb_scraped_metrics, indent=4))
+

@@ -1,0 +1,116 @@
+"""
+Additional feature engineering and preparation for modeling.
+Saves final X, y datasets for BOTH API and Scraped data.
+"""
+import pandas as pd
+import numpy as np
+import os
+
+def create_features_api(df):
+    """Creates features for the API dataset."""
+    df = df.copy()
+    
+    # Create target variable
+    df['log_views'] = np.log1p(df['view_count'].fillna(0))
+    
+    # Create boolean flags from title
+    df['has_4k'] = df['title'].str.contains('4K', case=False, na=False).astype(int)
+    df['has_tutorial'] = df['title'].str.contains('tutorial|how to|course', case=False, na=False).astype(int)
+    
+    # Simplify categories
+    if 'category_id' in df.columns:
+        top_cats = df['category_id'].value_counts().nlargest(10).index.tolist()
+        df['category_top'] = df['category_id'].where(df['category_id'].isin(top_cats), 'other')
+    else:
+        df['category_top'] = 'unknown'
+        
+    # Fill missing numeric values with the median
+    df['duration_min'] = df['duration_min'].fillna(df['duration_min'].median())
+    df['time_since_publish_days'] = df['time_since_publish_days'].fillna(df['time_since_publish_days'].median())
+    
+    # Define the feature set
+    features = [
+        'duration_min', 'title_len', 'title_word_count', 'num_tags', 
+        'time_since_publish_days', 'has_4k', 'has_tutorial'
+    ]
+    
+    X = df[features].copy()
+    
+    # One-hot encode the simplified categories
+    ohe = pd.get_dummies(df['category_top'], prefix='cat')
+    X = pd.concat([X, ohe], axis=1)
+    
+    # Get target variable
+    y = df['log_views']
+    
+    # Ensure all feature columns are present
+    all_feature_cols = features + [col for col in X.columns if col.startswith('cat_')]
+    X = X.reindex(columns=all_feature_cols, fill_value=0)
+    
+    return X, y
+
+def create_features_scraped(df):
+    """Creates features for the Scraped dataset."""
+    df = df.copy()
+    
+    # Create target variable
+    df['log_views'] = np.log1p(df['view_count'].fillna(0))
+    
+    # Create boolean flags from title
+    df['has_4k'] = df['title'].str.contains('4K', case=False, na=False).astype(int)
+    df['has_tutorial'] = df['title'].str.contains('tutorial|how to|course', case=False, na=False).astype(int)
+
+    # Fill missing numeric values with the median
+    df['time_since_publish_days'] = df['time_since_publish_days'].fillna(df['time_since_publish_days'].median())
+
+    # Define the feature set (much more limited)
+    features = [
+        'title_len', 'title_word_count', 
+        'time_since_publish_days', 'has_4k', 'has_tutorial'
+    ]
+    
+    X = df[features].copy()
+    y = df['log_views']
+    
+    return X, y
+
+if __name__ == '__main__':
+    print("Running feature engineering...")
+    PROCESSED_DIR = 'data/processed'
+    
+    API_PROC_PATH = os.path.join(PROCESSED_DIR, 'api_preprocessed.parquet')
+    SCRAPED_PROC_PATH = os.path.join(PROCESSED_DIR, 'scraped_preprocessed.parquet')
+
+    # --- Process API Data ---
+    try:
+        df_api = pd.read_parquet(API_PROC_PATH)
+        X_api, y_api = create_features_api(df_api)
+        
+        X_API_SAVE_PATH = os.path.join(PROCESSED_DIR, 'X_api_features.parquet')
+        Y_API_SAVE_PATH = os.path.join(PROCESSED_DIR, 'y_api_target.parquet')
+        
+        X_api.to_parquet(X_API_SAVE_PATH)
+        y_api.to_frame().to_parquet(Y_API_SAVE_PATH)
+        
+        print(f"Saved API X ({X_api.shape}) and y ({y_api.shape}) for modeling.")
+        print(f"API Feature columns: {X_api.columns.to_list()}")
+    except FileNotFoundError:
+        print(f"Error: Processed API file not found at {API_PROC_PATH}")
+        print("Please run 'preprocessing/preprocess.py' first.")
+
+    # --- Process Scraped Data ---
+    try:
+        df_scraped = pd.read_parquet(SCRAPED_PROC_PATH)
+        X_scraped, y_scraped = create_features_scraped(df_scraped)
+        
+        X_SCRAPED_SAVE_PATH = os.path.join(PROCESSED_DIR, 'X_scraped_features.parquet')
+        Y_SCRAPED_SAVE_PATH = os.path.join(PROCESSED_DIR, 'y_scraped_target.parquet')
+
+        X_scraped.to_parquet(X_SCRAPED_SAVE_PATH)
+        y_scraped.to_frame().to_parquet(Y_SCRAPED_SAVE_PATH)
+        
+        print(f"Saved Scraped X ({X_scraped.shape}) and y ({y_scraped.shape}) for modeling.")
+        print(f"Scraped Feature columns: {X_scraped.columns.to_list()}")
+    except FileNotFoundError:
+        print(f"Error: Processed Scraped file not found at {SCRAPED_PROC_PATH}")
+        print("Please run 'preprocessing/preprocess.py' first.")

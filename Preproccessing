@@ -1,0 +1,180 @@
+"""
+Load raw parquet files, clean fields, parse datetimes & durations.
+This script also samples the scraped data to match the length
+of the API data for a fair comparison.
+Saves two files:
+- data/processed/api_preprocessed.parquet
+- data/processed/scraped_preprocessed.parquet
+"""
+import pandas as pd
+import numpy as np
+import isodate
+from datetime import datetime
+import re
+import os
+
+# --- Helper Functions for Parsing ---
+
+def parse_iso_duration(dur):
+    """Converts ISO 8601 duration (e.g., 'PT5M30S') to seconds."""
+    if pd.isna(dur):
+        return np.nan
+    try:
+        td = isodate.parse_duration(dur)
+        return td.total_seconds()
+    except Exception:
+        return np.nan
+
+def normalize_counts(df):
+    """Converts count columns to numeric, handling errors."""
+    for col in ['view_count','like_count','comment_count']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    return df
+
+def parse_scraped_views(view_str):
+    """Converts scraped view strings (e.g., '1.2M views') to numeric."""
+    if not isinstance(view_str, str):
+        return np.nan
+    view_str = view_str.lower()
+    match = re.search(r'([\d\.]+)(k|m)?\sviews', view_str)
+    if not match:
+        return np.nan
+    
+    num = float(match.group(1))
+    if match.group(2) == 'k':
+        return num * 1_000
+    if match.group(2) == 'm':
+        return num * 1_000_000
+    return num
+
+def parse_scraped_age(age_str):
+    """Converts scraped age strings (e.g., '3 years ago') to days."""
+    if not isinstance(age_str, str):
+        return np.nan
+    
+    match = re.search(r'(\d+)\s(day|week|month|year)s?\sago', age_str)
+    if not match:
+        return np.nan
+        
+    num = int(match.group(1))
+    unit = match.group(2)
+    
+    if unit == 'day':
+        return num
+    if unit == 'week':
+        return num * 7
+    if unit == 'month':
+        return num * 30 # Approximation
+    if unit == 'year':
+        return num * 365 # Approximation
+    return np.nan
+
+# --- Main Preprocessing Functions ---
+
+def preprocess_api(path_in='data/raw_api.parquet', path_out='data/processed/api_preprocessed.parquet'):
+    """Loads and preprocesses the rich data from the YouTube API."""
+    print(f"Preprocessing API data from {path_in}...")
+    try:
+        df = pd.read_parquet(path_in)
+    except FileNotFoundError:
+        print(f"Error: Raw API file not found at {path_in}")
+        return None
+        
+    df = normalize_counts(df)
+    df['duration_s'] = df['duration'].apply(parse_iso_duration)
+    df['duration_min'] = df['duration_s'] / 60
+    df['publish_date'] = pd.to_datetime(df['publish_date'], errors='coerce')
+    
+    # Use a fixed timestamp for consistent 'age' calculation
+    processing_time = pd.Timestamp.utcnow()
+    df['time_since_publish_days'] = (processing_time - df['publish_date']).dt.days
+    
+    df['title_len'] = df['title'].astype(str).apply(len)
+    df['title_word_count'] = df['title'].astype(str).apply(lambda s: len(s.split()))
+    df['num_tags'] = df['tags'].apply(lambda t: len(t) if isinstance(t, list) else 0)
+    
+    # Add 1 to view_count to avoid division by zero
+    df['engagement_rate'] = (df['like_count'].fillna(0) + df['comment_count'].fillna(0)) / (df['view_count'].fillna(0) + 1)
+    
+    df.to_parquet(path_out, index=False)
+    print(f"Saved processed API data to {path_out}")
+    return df
+
+def preprocess_scraped(df_scraped, path_out='data/processed/scraped_preprocessed.parquet'):
+    """
+    Preprocesses the limited data from Selenium scraping.
+    Accepts a DataFrame (which should be the sampled one).
+    """
+    print("Preprocessing sampled scraped data...")
+    if df_scraped.empty:
+        print("Warning: Received empty scraped dataframe.")
+        return None
+
+    df = df_scraped.copy()
+    
+    # Parse the 'meta' column
+    meta_parts = df['meta'].str.split('•', expand=True)
+    df['view_str'] = meta_parts.get(0)
+    df['age_str'] = meta_parts.get(1)
+
+    df['view_count'] = df['view_str'].apply(parse_scraped_views)
+    df['time_since_publish_days'] = df['age_str'].apply(parse_scraped_age)
+    
+    df['title_len'] = df['title'].astype(str).apply(len)
+    df['title_word_count'] = df['title'].astype(str).apply(lambda s: len(s.split()))
+    
+    # Select and rename columns to be consistent
+    final_cols = [
+        'video_id', 'title', 'channel_title', 'view_count',
+        'time_since_publish_days', 'title_len', 'title_word_count'
+    ]
+    df_processed = df[final_cols].copy()
+    
+    df_processed.to_parquet(path_out, index=False)
+    print(f"Saved processed scraped data to {path_out}")
+    return df_processed
+
+
+if __name__ == '__main__':
+    API_RAW_PATH = 'data/raw_api.parquet'
+    SCRAPED_RAW_PATH = 'data/raw_scraped.parquet'
+    
+    PROCESSED_DIR = 'data/processed'
+    API_PROC_PATH = os.path.join(PROCESSED_DIR, 'api_preprocessed.parquet')
+    SCRAPED_PROC_PATH = os.path.join(PROCESSED_DIR, 'scraped_preprocessed.parquet')
+
+    # Ensure processed directory exists
+    os.makedirs(PROCESSED_DIR, exist_ok=True)
+    
+    # --- 1. Preprocess API Data ---
+    # We run this first to get the count for sampling
+    df_api = preprocess_api(path_in=API_RAW_PATH, path_out=API_PROC_PATH)
+    
+    if df_api is not None:
+        api_count = len(df_api)
+        print(f"API data has {api_count} records.")
+
+        # --- 2. Load and Sample Scraped Data ---
+        try:
+            df_scraped_raw = pd.read_parquet(SCRAPED_RAW_PATH)
+            print(f"Loaded {len(df_scraped_raw)} raw scraped records.")
+            
+            # Determine sample size
+            if len(df_scraped_raw) > api_count:
+                print(f"Sampling scraped data down to {api_count} records...")
+                df_scraped_sample = df_scraped_raw.sample(n=api_count, random_state=42)
+            else:
+                print("Using all scraped data (count is less than or equal to API data).")
+                df_scraped_sample = df_scraped_raw
+
+            # --- 3. Preprocess Scraped Data ---
+            preprocess_scraped(df_scraped_sample, path_out=SCRAPED_PROC_PATH)
+
+        except FileNotFoundError:
+            print(f"Error: Raw scraped file not found at {SCRAPED_RAW_PATH}")
+        
+    else:
+        print("Skipping scraped data processing because API data failed to load.")
+        
+    print("\nPreprocessing complete.")
